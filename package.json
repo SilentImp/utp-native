@@ -1,6 +1,6 @@
 {
-  "name": "@torrent-tv/utp-native",
-  "version": "2.5.3-ttv.1",
+  "name": "utp-native",
+  "version": "2.5.4-ttv.1",
   "description": "Native bindings for libutp — @torrent-tv build of 2.5.3 carrying the fix from https://github.com/mafintosh/utp-native/pull/58 (uninitialised napi_value read after napi_make_callback). Temporary: drop when that lands upstream.",
   "main": "index.js",
   "gypfile": true,
