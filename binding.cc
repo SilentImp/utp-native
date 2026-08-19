@@ -320,12 +320,27 @@ on_utp_accept (utp_callback_arguments *a) {
     napi_value argv[2];
     napi_create_uint32(env, port, &(argv[0]));
     napi_create_string_utf8(env, ip, NAPI_AUTO_LENGTH, &(argv[1]));
-    napi_value next;
-    NAPI_MAKE_CALLBACK(env, NULL, ctx, callback, 2, argv, &next) // will never throw due to the event being NTed in js
-    utp_napi_connection_t *connection;
-    size_t connection_size;
-    napi_get_buffer_info(env, next, (void **) &connection, &connection_size);
-    self->next_connection = connection;
+    // The comment this replaces read "will never throw due to the event being
+    // NTed in js". Throwing is not the only way a callback fails: once the
+    // environment is closing, or the reference to the function has gone,
+    // `napi_make_callback` returns without writing anything, and `next` was
+    // read anyway. An uninitialised `napi_value` is whatever the stack held,
+    // and V8 dereferences it inside `napi_get_buffer_info` — measured on the
+    // field host 2026-08-19 22:32 and 22:50, two SIGSEGVs whose stack is this
+    // line. Same defect as the one in `on_utp_read`, in the one other place
+    // that reads a callback's result.
+    napi_value next = NULL;
+    napi_status accept_status = napi_make_callback(env, NULL, ctx, callback, 2, argv, &next);
+    utp_napi_connection_t *connection = NULL;
+    size_t connection_size = 0;
+    if (accept_status == napi_ok && next != NULL &&
+        napi_get_buffer_info(env, next, (void **) &connection, &connection_size) == napi_ok &&
+        connection_size > 0) {
+      self->next_connection = connection;
+    }
+    // Otherwise the JavaScript side could not be reached, so there is no next
+    // connection to record. Leaving the field as it was is the only safe
+    // answer: writing a pointer nobody produced is what killed the process.
   })
 
   return 0;
