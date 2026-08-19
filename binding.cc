@@ -14,18 +14,21 @@
   }
 
 #define NAPI_MAKE_CALLBACK_AND_ALLOC(env, nil, ctx, cb, n, argv, res, nread) \
-  if (napi_make_callback(env, nil, ctx, cb, n, argv, &res) == napi_pending_exception) { \
-    napi_value fatal_exception; \
-    napi_get_and_clear_last_exception(env, &fatal_exception); \
-    napi_fatal_exception(env, fatal_exception); \
-    { \
-      UTP_NAPI_CALLBACK(self->realloc, { \
-        NAPI_MAKE_CALLBACK(env, nil, ctx, callback, 0, NULL, &res); \
-        UTP_NAPI_BUFFER_ALLOC(self, res, 0) \
-      }) \
+  { \
+    napi_status make_status = napi_make_callback(env, nil, ctx, cb, n, argv, &res); \
+    if (make_status == napi_pending_exception) { \
+      napi_value fatal_exception; \
+      napi_get_and_clear_last_exception(env, &fatal_exception); \
+      napi_fatal_exception(env, fatal_exception); \
+      { \
+        UTP_NAPI_CALLBACK(self->realloc, { \
+          NAPI_MAKE_CALLBACK(env, nil, ctx, callback, 0, NULL, &res); \
+          UTP_NAPI_BUFFER_ALLOC(self, res, 0) \
+        }) \
+      } \
+    } else if (make_status == napi_ok) { \
+      UTP_NAPI_BUFFER_ALLOC(self, res, nread) \
     } \
-  } else { \
-    UTP_NAPI_BUFFER_ALLOC(self, res, nread) \
   }
 
 #define UTP_NAPI_CALLBACK(fn, src) \
@@ -40,9 +43,12 @@
   napi_close_handle_scope(env, scope);
 
 #define UTP_NAPI_BUFFER_ALLOC(self, ret, nread) \
-  char *buf; \
-  size_t buf_len; \
-  napi_get_buffer_info(env, ret, (void **) &buf, &buf_len); \
+  char *buf = NULL; \
+  size_t buf_len = 0; \
+  if (ret == NULL || napi_get_buffer_info(env, ret, (void **) &buf, &buf_len) != napi_ok) { \
+    buf = NULL; \
+    buf_len = 0; \
+  } \
   if (buf_len == 0) { \
     size_t size = nread <= 0 ? 0 : nread; \
     self->buf.base += size; \
@@ -183,7 +189,7 @@ on_uv_read (uv_udp_t *handle, ssize_t nread, const uv_buf_t *buf, const struct s
   utp_napi_parse_address((struct sockaddr *) addr, ip, &port);
 
   UTP_NAPI_CALLBACK(self->on_message, {
-    napi_value ret;
+    napi_value ret = NULL;
     napi_value argv[3];
     napi_create_int32(env, nread, &(argv[0]));
     napi_create_uint32(env, port, &(argv[1]));
@@ -268,7 +274,7 @@ on_utp_state_change (utp_callback_arguments *a) {
     case UTP_STATE_EOF: {
       if (self->recv_packet_size) {
         UTP_NAPI_CALLBACK(self->on_read, {
-          napi_value ret;
+          napi_value ret = NULL;
           napi_value argv[1];
           napi_create_uint32(env, self->recv_packet_size, &(argv[0]));
           NAPI_MAKE_CALLBACK_AND_ALLOC(env, NULL, ctx, callback, 1, argv, ret, self->recv_packet_size)
@@ -350,7 +356,7 @@ on_utp_read (utp_callback_arguments *a) {
   }
 
   UTP_NAPI_CALLBACK(self->on_read, {
-    napi_value ret;
+    napi_value ret = NULL;
     napi_value argv[1];
     napi_create_uint32(env, self->recv_packet_size, &(argv[0]));
     NAPI_MAKE_CALLBACK_AND_ALLOC(env, NULL, ctx, callback, 1, argv, ret, self->recv_packet_size)
