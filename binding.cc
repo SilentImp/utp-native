@@ -184,6 +184,18 @@ on_uv_read (uv_udp_t *handle, ssize_t nread, const uv_buf_t *buf, const struct s
     if (utp_process_udp(self->utp, base, nread, addr, sizeof(struct sockaddr))) return;
   }
 
+  // libuv documents `addr` as nullable, and it is null whenever the read
+  // itself failed — that case arrives as `nread < 0`. The two branches above
+  // return only for `nread == 0` and for a datagram libutp consumed, so a
+  // failed read fell through to the parse below, which dereferences the
+  // pointer without checking it. Segmentation fault in the UDP read callback,
+  // on whichever thread owns the socket.
+  //
+  // There is nothing to give JavaScript here: no sender, and no payload. The
+  // part of this callback that must run on every wake-up is
+  // `utp_check_timeouts`, and that has already run above.
+  if (nread < 0 || addr == NULL) return;
+
   int port;
   char ip[17];
   utp_napi_parse_address((struct sockaddr *) addr, ip, &port);
