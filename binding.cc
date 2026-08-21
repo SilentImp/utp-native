@@ -317,6 +317,13 @@ static uint64
 on_utp_accept (utp_callback_arguments *a) {
   utp_napi_t *self = (utp_napi_t *) utp_context_get_userdata(a->context);
 
+  // No buffer to put this connection in means it cannot be accepted. That is
+  // not a hypothetical: the buffer for the NEXT connection comes back from
+  // JavaScript at the end of this function, and every way that can fail leaves
+  // nothing here. Dereferencing it anyway is a null write on the thread that
+  // owns the socket.
+  if (self->next_connection == NULL) return 0;
+
   struct sockaddr addr;
   socklen_t addr_len = sizeof(addr);
   utp_getpeername(a->socket, &addr, &addr_len);
@@ -332,12 +339,55 @@ on_utp_accept (utp_callback_arguments *a) {
     napi_value argv[2];
     napi_create_uint32(env, port, &(argv[0]));
     napi_create_string_utf8(env, ip, NAPI_AUTO_LENGTH, &(argv[1]));
-    napi_value next;
-    NAPI_MAKE_CALLBACK(env, NULL, ctx, callback, 2, argv, &next) // will never throw due to the event being NTed in js
-    utp_napi_connection_t *connection;
-    size_t connection_size;
-    napi_get_buffer_info(env, next, (void **) &connection, &connection_size);
-    self->next_connection = connection;
+    // Initialised, and the call's own answer is read.
+    //
+    // `NAPI_MAKE_CALLBACK` examines exactly one failure — `napi_pending_exception`
+    // — and even for that one it reports the exception and CARRIES ON. Every
+    // other status, `napi_invalid_arg` among them, is discarded, and in none of
+    // these cases does napi write anything to `res`. The next line then handed
+    // that value to `napi_get_buffer_info`, which asks V8 what it is; on an
+    // uninitialised handle that is a dereference of whatever the stack held.
+    //
+    // Field evidence, HA Yellow, two dumps on 2026-08-21 (16:49 and 19:50),
+    // both on the thread owning the uTP socket, both with the same top frames:
+    //
+    //   #0 v8::Value::IsArrayBufferView() const
+    //   #1 napi_get_buffer_info ()
+    //   #2 on_utp_accept(utp_callback_arguments*)   utp_native.node
+    //   #3 utp_call_on_accept(...)
+    //   #4 utp_process_udp ()
+    //   #5 on_uv_read(uv_udp_s*, ...)
+    //  #10 node::SpinEventLoopInternal(node::Environment*)
+    //  #11 node::worker::Worker::Run()
+    //
+    // The bottom of that stack is the ordinary event loop, so this is not the
+    // teardown race fixed separately: it is a datagram accepted during normal
+    // running whose callback did not answer.
+    //
+    // The comment this replaces read "will never throw due to the event being
+    // NTed in js". Whether it throws is beside the point — the value is unset
+    // either way.
+    napi_value next = NULL;
+    napi_status accept_status =
+      napi_make_callback(env, NULL, ctx, callback, 2, argv, &next);
+    if (accept_status == napi_pending_exception) {
+      napi_value fatal_exception;
+      napi_get_and_clear_last_exception(env, &fatal_exception);
+      napi_fatal_exception(env, fatal_exception);
+    }
+    utp_napi_connection_t *connection = NULL;
+    size_t connection_size = 0;
+    if (accept_status == napi_ok && next != NULL &&
+        napi_get_buffer_info(env, next, (void **) &connection, &connection_size) == napi_ok &&
+        connection_size >= sizeof(utp_napi_connection_t)) {
+      self->next_connection = connection;
+    } else {
+      // Nothing usable came back. The buffer that was here has just been given
+      // to the connection accepted above, so keeping it would hand the same
+      // memory to two connections. Cleared instead, and the guard at the top
+      // refuses further accepts until JavaScript supplies another one.
+      self->next_connection = NULL;
+    }
   })
 
   return 0;
