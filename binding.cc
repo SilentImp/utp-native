@@ -348,8 +348,8 @@ on_utp_accept (utp_callback_arguments *a) {
     // that value to `napi_get_buffer_info`, which asks V8 what it is; on an
     // uninitialised handle that is a dereference of whatever the stack held.
     //
-    // Field evidence, HA Yellow, two dumps on 2026-08-21 (16:49 and 19:50),
-    // both on the thread owning the uTP socket, both with the same top frames:
+    // Field evidence, four core dumps on a Raspberry-class host, all on the
+    // thread owning the uTP socket and all with the same top frames:
     //
     //   #0 v8::Value::IsArrayBufferView() const
     //   #1 napi_get_buffer_info ()
@@ -357,12 +357,23 @@ on_utp_accept (utp_callback_arguments *a) {
     //   #3 utp_call_on_accept(...)
     //   #4 utp_process_udp ()
     //   #5 on_uv_read(uv_udp_s*, ...)
-    //  #10 node::SpinEventLoopInternal(node::Environment*)
-    //  #11 node::worker::Worker::Run()
     //
-    // The bottom of that stack is the ordinary event loop, so this is not the
-    // teardown race fixed separately: it is a datagram accepted during normal
-    // running whose callback did not answer.
+    // They differ only below that. Two sat over `SpinEventLoopInternal` — the
+    // ordinary event loop — and two over `Environment::CleanupHandles` inside
+    // `FreeEnvironment`. That looked like two separate faults for two days. It
+    // is one, and node's own sources say why:
+    //
+    //   * `FreeEnvironment` sets `can_call_into_js(false)` BEFORE it calls
+    //     `RunCleanup` (`src/api/environment.cc`);
+    //   * `napi_make_callback` returns `napi_generic_failure` through
+    //     `CHECK_MAYBE_EMPTY` when `MakeCallback` yields an empty result, and
+    //     that early return writes nothing to `*result` (`src/node_api.cc`).
+    //
+    // So teardown is simply one of the ways this call fails without answering.
+    // Worth stating because the obvious remedy for the teardown pair — an
+    // `napi_add_env_cleanup_hook` that disarms the read — would not have helped
+    // either: `RunCleanup` drains the cleanup queue only AFTER `CleanupHandles`
+    // (`src/env.cc`), which is the frame those dumps died in.
     //
     // The comment this replaces read "will never throw due to the event being
     // NTed in js". Whether it throws is beside the point — the value is unset
