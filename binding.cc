@@ -7,6 +7,56 @@
 
 #define UTP_NAPI_TIMEOUT_INTERVAL 20
 
+// Room for the longest address text this module can meet. It used to be 17,
+// which is the IPv4 maximum, and that single number is what made every address
+// path here IPv4-only: an IPv6 literal did not fit, so it was never accepted.
+#define UTP_NAPI_IP_MAX 46
+
+// How much of a sockaddr is meaningful. libutp is handed this, and passing
+// sizeof(struct sockaddr) — as this module did — describes an IPv4 address and
+// truncates an IPv6 one.
+static inline size_t
+utp_napi_addr_len (const struct sockaddr *addr) {
+  return addr->sa_family == AF_INET6
+    ? sizeof(struct sockaddr_in6)
+    : sizeof(struct sockaddr_in);
+}
+
+// Text plus port to an address of whichever family the text names.
+static inline int
+utp_napi_addr_from_text (const char *ip, int port, struct sockaddr_storage *out) {
+  if (uv_ip4_addr(ip, port, (struct sockaddr_in *) out) == 0) return 0;
+  return uv_ip6_addr(ip, port, (struct sockaddr_in6 *) out);
+}
+
+// A dual-stack socket -- one bound to :: -- carries IPv4 peers as v4-mapped
+// addresses, and that mapping has to run in BOTH directions. The kernel does it
+// for arriving datagrams, which is why utp_napi_parse_address unmaps on the way
+// out; nothing does it for a datagram being sent, so an IPv4 destination
+// handed to an AF_INET6 socket is simply refused. Measured: with the
+// dual-stack default in place and this conversion missing, every test that
+// sends to 127.0.0.1 failed or hung.
+static inline void
+utp_napi_addr_for_socket (int family, struct sockaddr_storage *addr) {
+  if (family != AF_INET6 || addr->ss_family != AF_INET) return;
+
+  struct sockaddr_in v4;
+  memcpy(&v4, addr, sizeof(v4));
+
+  struct sockaddr_in6 v6;
+  memset(&v6, 0, sizeof(v6));
+  v6.sin6_family = AF_INET6;
+  v6.sin6_port = v4.sin_port;
+
+  unsigned char *bytes = (unsigned char *) &(v6.sin6_addr);
+  bytes[10] = 0xff;
+  bytes[11] = 0xff;
+  memcpy(bytes + 12, &(v4.sin_addr), 4);
+
+  memset(addr, 0, sizeof(*addr));
+  memcpy(addr, &v6, sizeof(v6));
+}
+
 #define UTP_NAPI_THROW(err) \
   { \
     napi_throw_error(env, uv_err_name(err), uv_strerror(err)); \
@@ -31,16 +81,30 @@
     } \
   }
 
+// Every napi call in here can fail, and a napi call that fails writes NOTHING
+// to the value it was handed. The original macro asked for a handle scope, a
+// context and a callback, checked none of the three, and then used all three --
+// so a failure at any step passed V8 whatever the stack happened to hold.
+//
+// This is the same fault that was fixed in on_utp_accept for 2.5.3-ttv.4 after
+// four core dumps named it. It was fixed there at that ONE call site, while the
+// macro every other call site goes through kept it.
+//
+// The scope now gates the body, and the body runs only once both references
+// have resolved to a real value.
 #define UTP_NAPI_CALLBACK(fn, src) \
   napi_env env = self->env; \
   napi_handle_scope scope; \
-  napi_open_handle_scope(env, &scope); \
-  napi_value ctx; \
-  napi_get_reference_value(env, self->ctx, &ctx); \
-  napi_value callback; \
-  napi_get_reference_value(env, fn, &callback); \
-  src \
-  napi_close_handle_scope(env, scope);
+  if (napi_open_handle_scope(env, &scope) == napi_ok) { \
+    napi_value ctx = NULL; \
+    napi_value callback = NULL; \
+    if (napi_get_reference_value(env, self->ctx, &ctx) == napi_ok && \
+        napi_get_reference_value(env, fn, &callback) == napi_ok && \
+        ctx != NULL && callback != NULL) { \
+      src \
+    } \
+    napi_close_handle_scope(env, scope); \
+  }
 
 #define UTP_NAPI_BUFFER_ALLOC(self, ret, nread) \
   char *buf = NULL; \
@@ -77,6 +141,12 @@ typedef struct {
   napi_ref on_close;
   napi_ref on_connect;
   napi_ref realloc;
+  // Teardown can be reached twice: libutp announces UTP_STATE_DESTROYING from
+  // ~UTPSocket(), and JavaScript calls utp_napi_connection_on_close directly
+  // when a client connection is abandoned before it ever connected. The six
+  // napi_delete_reference calls in the teardown are not idempotent, so a
+  // second run deletes references that are already gone.
+  uint32_t destroyed;
 } utp_napi_connection_t;
 
 typedef struct {
@@ -95,6 +165,9 @@ typedef struct {
   napi_ref realloc;
   int pending_close;
   int closing;
+  // The address family this socket was actually bound with. Everything sent
+  // from it has to be expressed in that family.
+  int family;
 } utp_napi_t;
 
 typedef struct {
@@ -107,8 +180,19 @@ on_sendto_free (uv_udp_send_t *req, int status) {
   free(req);
 }
 
+// libutp asserts rather than tolerating a call on a socket that is gone
+// (utp_writev:3158, utp_close:3360), and before the socket pointer was cleared
+// on teardown the same calls simply worked on released memory. Both answers
+// are wrong; this is the question both were failing to ask.
+inline static int
+utp_napi_connection_gone (utp_napi_connection_t *self) {
+  return self == NULL || self->destroyed || self->socket == NULL;
+}
+
 static int
 utp_napi_connection_drain (utp_napi_connection_t *self) {
+  // Nothing is pending on a connection that can no longer be spoken to.
+  if (utp_napi_connection_gone(self)) return 1;
 
   struct utp_iovec *next = self->send_buffer_next;
   uint32_t missing = self->send_buffer_missing;
@@ -147,9 +231,31 @@ utp_napi_connection_drain (utp_napi_connection_t *self) {
 
 inline static void
 utp_napi_parse_address (struct sockaddr *name, char *ip, int *port) {
+  if (name->sa_family == AF_INET6) {
+    struct sockaddr_in6 *name_in6 = (struct sockaddr_in6 *) name;
+    *port = ntohs(name_in6->sin6_port);
+
+    // A dual-stack socket reports an IPv4 peer as ::ffff:1.2.3.4. Handing that
+    // text upwards would change what every existing caller sees for an IPv4
+    // peer, so it is unmapped back to plain IPv4 — which is also what libutp
+    // does internally with its own PackedSockAddr.
+    if (IN6_IS_ADDR_V4MAPPED(&(name_in6->sin6_addr))) {
+      struct sockaddr_in mapped;
+      memset(&mapped, 0, sizeof(mapped));
+      mapped.sin_family = AF_INET;
+      mapped.sin_port = name_in6->sin6_port;
+      memcpy(&(mapped.sin_addr), ((const char *) &(name_in6->sin6_addr)) + 12, 4);
+      uv_ip4_name(&mapped, ip, UTP_NAPI_IP_MAX);
+      return;
+    }
+
+    uv_ip6_name(name_in6, ip, UTP_NAPI_IP_MAX);
+    return;
+  }
+
   struct sockaddr_in *name_in = (struct sockaddr_in *) name;
   *port = ntohs(name_in->sin_port);
-  uv_ip4_name(name_in, ip, 17);
+  uv_ip4_name(name_in, ip, UTP_NAPI_IP_MAX);
 }
 
 static void
@@ -179,9 +285,9 @@ on_uv_read (uv_udp_t *handle, ssize_t nread, const uv_buf_t *buf, const struct s
     return;
   }
 
-  if (nread > 0) {
+  if (nread > 0 && addr != NULL) {
     const unsigned char *base = (const unsigned char *) buf->base;
-    if (utp_process_udp(self->utp, base, nread, addr, sizeof(struct sockaddr))) return;
+    if (utp_process_udp(self->utp, base, nread, addr, utp_napi_addr_len(addr))) return;
   }
 
   // libuv documents `addr` as nullable, and it is null whenever the read
@@ -197,7 +303,7 @@ on_uv_read (uv_udp_t *handle, ssize_t nread, const uv_buf_t *buf, const struct s
   if (nread < 0 || addr == NULL) return;
 
   int port;
-  char ip[17];
+  char ip[UTP_NAPI_IP_MAX];
   utp_napi_parse_address((struct sockaddr *) addr, ip, &port);
 
   UTP_NAPI_CALLBACK(self->on_message, {
@@ -240,16 +346,31 @@ static uint64
 on_utp_firewall (utp_callback_arguments *a) {
   utp_napi_t *self = (utp_napi_t *) utp_context_get_userdata(a->context);
 
+  // Refuse rather than dereference. Non-zero means "do not accept".
+  if (self == NULL) return 1;
+
   return self->accept_connections ? 0 : 1;
 }
 
 inline static void
 utp_napi_connection_destroy (utp_napi_connection_t *self) {
+  if (self == NULL || self->destroyed) return;
+  self->destroyed = 1;
+
+  // The socket must stop pointing back at this struct BEFORE anything is
+  // released. libutp goes on delivering callbacks for a socket it is in the
+  // middle of destroying, and every one of them begins by reading this
+  // pointer; leaving it in place is what lets a later callback walk into
+  // memory whose napi references have just been deleted.
+  if (self->socket != NULL) {
+    utp_set_userdata(self->socket, NULL);
+    self->socket = NULL;
+  }
+
   UTP_NAPI_CALLBACK(self->on_close, {
     NAPI_MAKE_CALLBACK(env, NULL, ctx, callback, 0, NULL, NULL)
   })
 
-  self->env = env;
   self->buf.base = NULL;
   self->buf.len = 0;
 
@@ -265,6 +386,29 @@ utp_napi_connection_destroy (utp_napi_connection_t *self) {
 static uint64
 on_utp_state_change (utp_callback_arguments *a) {
   utp_napi_connection_t *self = (utp_napi_connection_t *) utp_get_userdata(a->socket);
+
+  // A socket without userdata is not hypothetical, and the guard added in
+  // 2.5.3-ttv.4 is one of the ways it arises: an incoming connection arriving
+  // while JavaScript has supplied no buffer for the next one is refused BEFORE
+  // utp_set_userdata is reached, so the socket exists with nothing attached --
+  // and its ~UTPSocket() still announces UTP_STATE_DESTROYING. A socket the
+  // firewall callback rejects is another way.
+  //
+  // Field evidence, 2026-08-26, one core dump on a Raspberry-class host:
+  //
+  //   #0 v8::HandleScope::HandleScope(v8::Isolate*)
+  //   #1 napi_open_handle_scope ()
+  //   #2 on_utp_state_change(utp_callback_arguments*)   utp_native.node
+  //   #3 utp_call_on_state_change(...)
+  //   #4 UTPSocket::~UTPSocket()
+  //   #5 utp_check_timeouts ()
+  //   #6 on_uv_read(uv_udp_s*, ...)
+  //
+  // Read upwards: a datagram arrived, libutp swept its timeouts, destroyed a
+  // socket, and the destructor called in here -- where self->env was read off a
+  // pointer that had never been set. The whole proxy died with it, since a
+  // fault on any thread ends the process.
+  if (self == NULL) return 0;
 
   switch (a->state) {
     case UTP_STATE_CONNECT: {
@@ -324,13 +468,15 @@ on_utp_accept (utp_callback_arguments *a) {
   // owns the socket.
   if (self->next_connection == NULL) return 0;
 
-  struct sockaddr addr;
+  // sockaddr is too small to hold an IPv6 peer; sockaddr_storage is the type
+  // that is guaranteed to hold any of them.
+  struct sockaddr_storage addr;
   socklen_t addr_len = sizeof(addr);
-  utp_getpeername(a->socket, &addr, &addr_len);
+  utp_getpeername(a->socket, (struct sockaddr *) &addr, &addr_len);
 
   int port;
-  char ip[17];
-  utp_napi_parse_address(&addr, ip, &port);
+  char ip[UTP_NAPI_IP_MAX];
+  utp_napi_parse_address((struct sockaddr *) &addr, ip, &port);
 
   self->next_connection->socket = a->socket;
   utp_set_userdata(a->socket, self->next_connection);
@@ -408,6 +554,10 @@ static uint64
 on_utp_error (utp_callback_arguments *a) {
   utp_napi_connection_t *self = (utp_napi_connection_t *) utp_get_userdata(a->socket);
 
+  // Same exposure as on_utp_state_change: an error can be reported for a socket
+  // that never had a connection attached, and there is no one to tell.
+  if (self == NULL) return 0;
+
   UTP_NAPI_CALLBACK(self->on_error, {
     napi_value argv[1];
     napi_create_int32(env, a->error_code, &(argv[0]));
@@ -421,8 +571,67 @@ static uint64
 on_utp_read (utp_callback_arguments *a) {
   utp_napi_connection_t *self = (utp_napi_connection_t *) utp_get_userdata(a->socket);
 
-  memcpy(self->buf.base + self->recv_packet_size, a->buf, a->len);
-  self->recv_packet_size += a->len;
+  if (self == NULL) return 0;
+
+  // The copy below used to be written without once consulting the size of the
+  // buffer it was writing into. self->buf.len is maintained on every hand-off
+  // to JavaScript (UTP_NAPI_BUFFER_ALLOC either sets it, or advances base and
+  // shrinks len by what was consumed) and was simply never read here, so a peer
+  // sending more between two hand-offs than the current buffer still holds
+  // wrote past its end.
+  //
+  // That is a heap overwrite, and a heap overwrite does not fault where it
+  // happens -- it faults later, inside whatever structure occupied the memory.
+  // It is the best candidate for the deaths of 2026-08-18..25 that all landed
+  // in libuv's own bookkeeping (uv_timer_stop under
+  // PerIsolatePlatformData::Shutdown) with no explanation of how those
+  // structures came to be corrupt.
+  //
+  // Data is not dropped to make room: what has accumulated is handed to
+  // JavaScript, which answers with a fresh buffer, and the rest of the packet
+  // goes into that. Dropping bytes libutp has already acknowledged would
+  // corrupt the stream silently, which is worse than the crash.
+  const unsigned char *chunk = (const unsigned char *) a->buf;
+  size_t remaining = a->len;
+  int handovers = 0;
+
+  while (remaining > 0) {
+    size_t room = self->buf.len > self->recv_packet_size
+      ? self->buf.len - self->recv_packet_size
+      : 0;
+
+    if (room == 0) {
+      // Two hand-offs in a row that freed no room mean JavaScript is not
+      // supplying a usable buffer. Writing anyway is the fault this guard
+      // exists to prevent, so the connection is told instead.
+      if (self->recv_packet_size == 0 || handovers >= 2) {
+        UTP_NAPI_CALLBACK(self->on_error, {
+          napi_value argv[1];
+          napi_create_int32(env, UV_ENOBUFS, &(argv[0]));
+          NAPI_MAKE_CALLBACK(env, NULL, ctx, callback, 1, argv, NULL)
+        })
+        return 0;
+      }
+      {
+        UTP_NAPI_CALLBACK(self->on_read, {
+          napi_value ret = NULL;
+          napi_value argv[1];
+          napi_create_uint32(env, self->recv_packet_size, &(argv[0]));
+          NAPI_MAKE_CALLBACK_AND_ALLOC(env, NULL, ctx, callback, 1, argv, ret, self->recv_packet_size)
+          self->recv_packet_size = 0;
+        })
+      }
+      handovers++;
+      continue;
+    }
+
+    size_t take = remaining < room ? remaining : room;
+    memcpy(self->buf.base + self->recv_packet_size, chunk, take);
+    self->recv_packet_size += take;
+    chunk += take;
+    remaining -= take;
+    handovers = 0;
+  }
 
   if (self->recv_packet_size < self->min_recv_packet_size) {
     return 0;
@@ -448,6 +657,9 @@ on_utp_sendto (utp_callback_arguments *a) {
 
   char *cpy = (char *) malloc(sizeof(uv_udp_send_t) + a->len);
 
+  // Out of memory is a dropped datagram -- uTP retransmits -- not a null write.
+  if (cpy == NULL) return 0;
+
   buf.base = cpy + sizeof(uv_udp_send_t);
   memcpy(buf.base, a->buf, a->len);
 
@@ -462,6 +674,7 @@ NAPI_METHOD(utp_napi_init) {
 
   self->closing = 0;
   self->pending_close = 2;
+  self->family = AF_UNSPEC;
   self->env = env;
   napi_create_reference(env, argv[1], 1, &(self->ctx));
 
@@ -558,18 +771,22 @@ NAPI_METHOD(utp_napi_bind) {
   NAPI_ARGV(3)
   NAPI_ARGV_BUFFER_CAST(utp_napi_t *, self, 0)
   NAPI_ARGV_UINT32(port, 1)
-  NAPI_ARGV_UTF8(ip, 17, 2)
+  NAPI_ARGV_UTF8(ip, UTP_NAPI_IP_MAX, 2)
 
   uv_udp_t *handle = &(self->handle);
 
   int err;
-  struct sockaddr_in addr;
+  struct sockaddr_storage addr;
 
-  err = uv_ip4_addr((char *) &ip, port, &addr);
+  err = utp_napi_addr_from_text((char *) &ip, port, &addr);
   if (err < 0) UTP_NAPI_THROW(err)
 
+  // No UV_UDP_IPV6ONLY: a socket bound to :: then carries IPv4 peers too, as
+  // v4-mapped addresses, which utp_napi_parse_address unmaps on the way out.
   err = uv_udp_bind(handle, (const struct sockaddr*) &addr, 0);
   if (err < 0) UTP_NAPI_THROW(err)
+
+  self->family = addr.ss_family;
 
   // TODO: We should close the handle here also if this fails
   err = uv_udp_recv_start(handle, on_uv_alloc, on_uv_read);
@@ -589,14 +806,15 @@ NAPI_METHOD(utp_napi_local_port) {
   NAPI_ARGV_BUFFER_CAST(utp_napi_t *, self, 0)
 
   int err;
-  struct sockaddr name;
+  struct sockaddr_storage name;
   int name_len = sizeof(name);
 
-  err = uv_udp_getsockname(&(self->handle), &name, &name_len);
+  err = uv_udp_getsockname(&(self->handle), (struct sockaddr *) &name, &name_len);
   if (err < 0) UTP_NAPI_THROW(err)
 
-  struct sockaddr_in *name_in = (struct sockaddr_in *) &name;
-  int port = ntohs(name_in->sin_port);
+  int port = name.ss_family == AF_INET6
+    ? ntohs(((struct sockaddr_in6 *) &name)->sin6_port)
+    : ntohs(((struct sockaddr_in *) &name)->sin_port);
 
   NAPI_RETURN_UINT32(port)
 }
@@ -621,7 +839,7 @@ NAPI_METHOD(utp_napi_send) {
   NAPI_ARGV_UINT32(offset, 3)
   NAPI_ARGV_UINT32(len, 4)
   NAPI_ARGV_UINT32(port, 5)
-  NAPI_ARGV_UTF8(ip, 17, 6)
+  NAPI_ARGV_UTF8(ip, UTP_NAPI_IP_MAX, 6)
 
   uv_udp_send_t *req = &(send_req->req);
 
@@ -629,11 +847,13 @@ NAPI_METHOD(utp_napi_send) {
   bufs.base = buf + offset;
   bufs.len = len;
 
-  struct sockaddr_in addr;
+  struct sockaddr_storage addr;
   int err;
 
-  err = uv_ip4_addr((char *) &ip, port, &addr);
+  err = utp_napi_addr_from_text((char *) &ip, port, &addr);
   if (err) UTP_NAPI_THROW(err)
+
+  utp_napi_addr_for_socket(self->family, &addr);
 
   err = uv_udp_send(req, &(self->handle), &bufs, 1, (const struct sockaddr *) &addr, on_uv_send);
   if (err) UTP_NAPI_THROW(err)
@@ -729,6 +949,12 @@ NAPI_METHOD(utp_napi_connection_write) {
   NAPI_ARGV_BUFFER_CAST(utp_napi_connection_t *, self, 0)
   NAPI_ARGV_BUFFER(buf, 1)
 
+  // A write that arrives after teardown is a write to a closed socket. The
+  // stream has already been ended on the JavaScript side by on_close, so it is
+  // reported as drained: nothing is left pending, and nothing waits for an
+  // on_drain that can never come.
+  if (utp_napi_connection_gone(self)) { NAPI_RETURN_UINT32(1) }
+
   self->send_buffer_next = self->send_buffer;
   self->send_buffer_next->iov_base = buf;
   self->send_buffer_next->iov_len = buf_len;
@@ -741,6 +967,9 @@ NAPI_METHOD(utp_napi_connection_write) {
 NAPI_METHOD(utp_napi_connection_writev) {
   NAPI_ARGV(2)
   NAPI_ARGV_BUFFER_CAST(utp_napi_connection_t *, self, 0)
+
+  // Same as utp_napi_connection_write above.
+  if (utp_napi_connection_gone(self)) { NAPI_RETURN_UINT32(1) }
 
   napi_value bufs = argv[1];
   struct utp_iovec *next = self->send_buffer_next = self->send_buffer;
@@ -763,6 +992,9 @@ NAPI_METHOD(utp_napi_connection_shutdown) {
   NAPI_ARGV(1)
   NAPI_ARGV_BUFFER_CAST(utp_napi_connection_t *, self, 0)
 
+  // Already shut down as far as anyone can tell.
+  if (utp_napi_connection_gone(self)) return NULL;
+
   utp_shutdown(self->socket, SHUT_WR);
 
   return NULL;
@@ -771,6 +1003,10 @@ NAPI_METHOD(utp_napi_connection_shutdown) {
 NAPI_METHOD(utp_napi_connection_close) {
   NAPI_ARGV(1)
   NAPI_ARGV_BUFFER_CAST(utp_napi_connection_t *, self, 0)
+
+  // Closing twice is what the module's own "double close" test does, and the
+  // second call must not reach libutp with a pointer that is gone.
+  if (utp_napi_connection_gone(self)) return NULL;
 
   utp_close(self->socket);
 
@@ -782,21 +1018,27 @@ NAPI_METHOD(utp_napi_connect) {
   NAPI_ARGV_BUFFER_CAST(utp_napi_t *, self, 0)
   NAPI_ARGV_BUFFER_CAST(utp_napi_connection_t *, conn, 1)
   NAPI_ARGV_UINT32(port, 2)
-  NAPI_ARGV_UTF8(ip, 17, 3)
+  NAPI_ARGV_UTF8(ip, UTP_NAPI_IP_MAX, 3)
 
   int err;
-  struct sockaddr_in addr;
+  struct sockaddr_storage addr;
 
-  // TODO: error handle
+  // The address is parsed BEFORE a socket exists. In the original order the
+  // socket was created and given its userdata first, so an address that could
+  // not be parsed left a socket created, registered and abandoned, with nothing
+  // that would ever connect or close it. libutp then destroys it on its own
+  // schedule, which is the callback path the crash of 2026-08-26 came down.
+  err = utp_napi_addr_from_text((char *) &ip, port, &addr);
+  if (err) UTP_NAPI_THROW(err)
+
+  utp_napi_addr_for_socket(self->family, &addr);
+
   conn->socket = utp_create_socket(self->utp);
+  if (conn->socket == NULL) UTP_NAPI_THROW(UV_ENOMEM)
 
   utp_set_userdata(conn->socket, conn);
 
-  err = uv_ip4_addr((char *) &ip, port, &addr);
-  if (err) UTP_NAPI_THROW(err)
-
-  // TODO: error handle
-  utp_connect(conn->socket, (struct sockaddr *) &addr, sizeof(struct sockaddr_in));
+  utp_connect(conn->socket, (struct sockaddr *) &addr, utp_napi_addr_len((struct sockaddr *) &addr));
 
   return NULL;
 }

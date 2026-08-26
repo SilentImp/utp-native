@@ -2,11 +2,12 @@ const binding = require('./lib/binding')
 const Connection = require('./lib/connection')
 const util = require('util')
 const events = require('events')
-const dns = require('dns')
+const lookup = require('./lib/lookup')
+const net = require('net')
 const set = require('unordered-set')
 
 const EMPTY = Buffer.alloc(0)
-const IPv4Pattern = /^((?:[0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])[.]){3}(?:[0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])$/
+
 
 module.exports = UTP
 
@@ -80,7 +81,7 @@ UTP.prototype.address = function () {
   if (!this._address || this._closing) throw new Error('Socket not bound')
   return {
     address: this._address,
-    family: 'IPv4',
+    family: familyOf(this._address),
     port: binding.utp_napi_local_port(this._handle)
   }
 }
@@ -137,13 +138,10 @@ UTP.prototype.send = function (buf, offset, len, port, host, cb) {
 UTP.prototype._resolveAndSend = function (buf, offset, len, port, host, cb) {
   const self = this
 
-  dns.lookup(host, onlookup)
-
-  function onlookup (err, ip) {
+  lookup(host, function (err, ip) {
     if (err) return cb(err)
-    if (!ip) return cb(new Error('Could not resolve ' + host))
     self.send(buf, offset, len, port, ip, cb)
-  }
+  })
 }
 
 UTP.prototype.close = function (onclose) {
@@ -179,7 +177,16 @@ UTP.prototype.bind = function (port, ip, onlistening) {
   if (typeof port === 'function') return this.bind(0, null, port)
   if (typeof ip === 'function') return this.bind(port, null, ip)
   if (!port) port = 0
-  if (!ip) ip = '0.0.0.0'
+
+  // With no address given, prefer a dual-stack socket: bound to ::, one socket
+  // carries IPv6 peers and IPv4 ones alike (the latter as v4-mapped addresses,
+  // which the native layer unmaps again on the way out). Before this the
+  // default was 0.0.0.0, and a uTP socket could not reach an IPv6 peer at all.
+  //
+  // A host with IPv6 switched off cannot bind ::, so the attempt falls back to
+  // IPv4 where the native error is seen, below.
+  const chosenByUs = !ip
+  if (!ip) ip = '::'
 
   if (!this._inited) this._init()
   if (this._closing) return
@@ -198,6 +205,22 @@ UTP.prototype.bind = function (port, ip, onlistening) {
     binding.utp_napi_bind(this._handle, port, ip)
   } catch (err) {
     this._address = null
+
+    // Only an address this module chose is replaced. One the caller asked for
+    // is not swapped underneath them — they get the error.
+    if (chosenByUs) {
+      try {
+        binding.utp_napi_bind(this._handle, port, '0.0.0.0')
+        this._address = '0.0.0.0'
+        process.nextTick(emitListening, this)
+        return
+      } catch (ipv4Err) {
+        this._address = null
+        process.nextTick(emitError, this, ipv4Err)
+        return
+      }
+    }
+
     process.nextTick(emitError, this, err)
     return
   }
@@ -208,7 +231,7 @@ UTP.prototype.bind = function (port, ip, onlistening) {
 UTP.prototype._resolveAndBind = function (port, host) {
   const self = this
 
-  dns.lookup(host, function (err, ip) {
+  lookup(host, function (err, ip) {
     if (err) return self.emit('error', err)
     self.bind(port, ip)
   })
@@ -227,7 +250,7 @@ UTP.prototype._onmessage = function (size, port, address) {
   }
 
   const message = this._buffer.slice(this._offset, this._offset += size)
-  this.emit('message', message, { address, family: 'IPv4', port })
+  this.emit('message', message, { address, family: familyOf(address), port })
 
   if (this._buffer.length - this._offset <= 65536) {
     this._buffer = Buffer.allocUnsafe(this._buffer.length)
@@ -272,7 +295,11 @@ function SendRequest () {
 function noop () {}
 
 function isIP (ip) {
-  return IPv4Pattern.test(ip)
+  return net.isIP(ip) !== 0
+}
+
+function familyOf (ip) {
+  return net.isIP(ip) === 6 ? 'IPv6' : 'IPv4'
 }
 
 function toHandle (obj) {

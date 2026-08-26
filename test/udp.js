@@ -6,7 +6,11 @@ tape('bind', function (t) {
 
   sock.bind(function () {
     const { port, address } = sock.address()
-    t.same(address, '0.0.0.0')
+    // A bind with no address asks for both families at once, so the socket
+    // reports the unspecified IPv6 address rather than the IPv4 one. IPv4
+    // peers still reach it: they arrive v4-mapped and are unmapped on the way
+    // out, and outgoing IPv4 destinations are mapped on the way in.
+    t.same(address, '::')
     t.same(typeof port, 'number')
     t.ok(port > 0 && port < 65536)
     sock.close(() => t.end())
@@ -18,7 +22,11 @@ tape('bind, close, bind', function (t) {
 
   sock.bind(function () {
     const { port, address } = sock.address()
-    t.same(address, '0.0.0.0')
+    // A bind with no address asks for both families at once, so the socket
+    // reports the unspecified IPv6 address rather than the IPv4 one. IPv4
+    // peers still reach it: they arrive v4-mapped and are unmapped on the way
+    // out, and outgoing IPv4 destinations are mapped on the way in.
+    t.same(address, '::')
     t.same(typeof port, 'number')
     t.ok(port > 0 && port < 65536)
     sock.close(function () {
