@@ -165,6 +165,26 @@ typedef struct {
   napi_ref realloc;
   int pending_close;
   int closing;
+  /**
+   * Whether this environment can still be called into.
+   *
+   * Plain memory on purpose: every other way of asking — instance data, a
+   * reference, anything through napi — needs the very environment whose
+   * liveness is in question, and reading it when it is gone is the fault this
+   * flag exists to prevent. Set to 1 at init, cleared by the environment's own
+   * cleanup hook, and read by every callback before it touches napi.
+   */
+  int env_alive;
+  /**
+   * A strong reference to the JavaScript buffer this struct LIVES IN.
+   *
+   * `uv_udp_t handle` and `uv_timer_t timer` above are fields of this struct,
+   * and `uv_udp_init`/`uv_timer_init` register them on the loop — so libuv
+   * holds pointers into memory owned by the garbage collector for as long as
+   * they stay registered. Held from here until both handles have closed, so
+   * the collector cannot take it out from under libuv.
+   */
+  napi_ref self_ref;
   // The address family this socket was actually bound with. Everything sent
   // from it has to be expressed in that family.
   int family;
@@ -258,9 +278,84 @@ utp_napi_parse_address (struct sockaddr *name, char *ip, int *port) {
   uv_ip4_name(name_in, ip, UTP_NAPI_IP_MAX);
 }
 
+/**
+ * Close everything this context owns, because the environment is going away.
+ *
+ * The fault this exists to remove, from a core dump of 2026-08-27:
+ *
+ *   #0 uv_timer_stop
+ *   #1 uv_close
+ *   #2 node::PerIsolatePlatformData::Shutdown()
+ *   #3 node::NodePlatform::UnregisterIsolate(v8::Isolate*)
+ *   #4 node::worker::Worker::Run()
+ *
+ * Read upwards: the thread's function returned, node unregistered its isolate
+ * and began closing what was left on the loop — and walked into memory that is
+ * no longer there. The handles are fields of a struct that lives inside a
+ * JavaScript buffer, so when the isolate's heap goes they go with it, while
+ * libuv still has them registered. On the main thread this is invisible: the
+ * process is ending anyway. On a worker thread the process lives on, and the
+ * fault kills all of it — HTTP server, tunnel, data channels — before any
+ * JavaScript handler runs.
+ *
+ * `napi_add_env_cleanup_hook` is early enough, which the previous note in this
+ * file doubted. `Environment::RunCleanup` (node `src/env.cc`) calls
+ * `CleanupHandles()`, then drains the cleanup queue — where this hook sits —
+ * and then calls `CleanupHandles()` AGAIN inside the same loop. So a
+ * `uv_close` issued from here is completed by that second pass, long before
+ * `PerIsolatePlatformData::Shutdown` looks at the loop.
+ *
+ * Two things happen here and their order matters. The flag goes first, so that
+ * any callback which still fires during teardown returns without touching
+ * napi. Only then are the handles closed.
+ *
+ * @param arg - The context, as handed to `napi_add_env_cleanup_hook`.
+ * @returns {void}
+ */
+static void
+on_env_teardown (void *arg) {
+  utp_napi_t *self = (utp_napi_t *) arg;
+  if (self == NULL) return;
+
+  self->env_alive = 0;
+
+  if (self->closing) return;
+  self->closing = 1;
+
+  uv_timer_stop(&(self->timer));
+  uv_udp_recv_stop(&(self->handle));
+
+  // No close callback: it would call into JavaScript, and there is none left to
+  // call. libuv only has to stop knowing about these handles.
+  if (!uv_is_closing((uv_handle_t *) &(self->handle))) {
+    uv_close((uv_handle_t *) &(self->handle), NULL);
+  }
+  if (!uv_is_closing((uv_handle_t *) &(self->timer))) {
+    uv_close((uv_handle_t *) &(self->timer), NULL);
+  }
+}
+
+/**
+ * Whether it is still legal to call into JavaScript for this context.
+ *
+ * Every callback below reaches napi sooner or later, and every one of them can
+ * fire while the environment is being torn down: libuv keeps delivering, and
+ * libutp keeps sweeping its timeouts, until their handles are closed. Reading
+ * a plain int costs nothing and is the only check that does not itself need
+ * the environment.
+ *
+ * @param self - The context, or NULL when the callback could not find one.
+ * @returns Non-zero while the environment can be called into.
+ */
+static inline int
+utp_napi_can_call_js (utp_napi_t *self) {
+  return self != NULL && self->env_alive;
+}
+
 static void
 on_uv_interval (uv_timer_t *req) {
   utp_napi_t *self = (utp_napi_t *) req->data;
+  if (!utp_napi_can_call_js(self)) return;
   utp_issue_deferred_acks(self->utp);
   utp_check_timeouts(self->utp);
 }
@@ -268,12 +363,23 @@ on_uv_interval (uv_timer_t *req) {
 static void
 on_uv_alloc (uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
   utp_napi_t *self = (utp_napi_t *) handle->data;
+  // The read buffer is JavaScript memory too. With the environment gone there
+  // is nowhere to put a datagram, so libuv is told there is no room.
+  if (!utp_napi_can_call_js(self)) {
+    buf->base = NULL;
+    buf->len = 0;
+    return;
+  }
   *buf = self->buf;
 }
 
 static void
 on_uv_read (uv_udp_t *handle, ssize_t nread, const uv_buf_t *buf, const struct sockaddr *addr, unsigned flags) {
   utp_napi_t *self = (utp_napi_t *) handle->data;
+  // This is the callback the 2026-08-27 crash arrived through: a datagram, then
+  // libutp's timeout sweep, then a socket destructor, then napi on a dead
+  // environment. Nothing below is safe once the environment is going.
+  if (!utp_napi_can_call_js(self)) return;
 
   // TODO: is this overkill to call here?
   // we do it because ucat.c does it
@@ -323,6 +429,16 @@ on_uv_close (uv_handle_t *handle) {
   self->pending_close--;
   if (self->pending_close > 0) return;
 
+  // libuv has finished with both handles, so the memory they live in is free to
+  // go. Released before the callback, because that callback is where
+  // JavaScript drops its own reference to the same buffer.
+  if (self->env_alive && self->self_ref != NULL) {
+    napi_delete_reference(self->env, self->self_ref);
+    self->self_ref = NULL;
+  }
+
+  if (!utp_napi_can_call_js(self)) return;
+
   UTP_NAPI_CALLBACK(self->on_close, {
     NAPI_MAKE_CALLBACK(env, NULL, ctx, callback, 0, NULL, NULL);
   })
@@ -332,6 +448,7 @@ static void
 on_uv_send (uv_udp_send_t *req, int status) {
   uv_udp_t *handle = req->handle;
   utp_napi_t *self = (utp_napi_t *) handle->data;
+  if (!utp_napi_can_call_js(self)) return;
   utp_napi_send_request_t *send = (utp_napi_send_request_t *) req->data;
 
   UTP_NAPI_CALLBACK(self->on_send, {
@@ -346,8 +463,10 @@ static uint64
 on_utp_firewall (utp_callback_arguments *a) {
   utp_napi_t *self = (utp_napi_t *) utp_context_get_userdata(a->context);
 
-  // Refuse rather than dereference. Non-zero means "do not accept".
-  if (self == NULL) return 1;
+  // Refuse rather than dereference. Non-zero means "do not accept". A context
+  // whose environment has gone refuses everything: an accepted connection
+  // would need JavaScript to own it.
+  if (!utp_napi_can_call_js(self)) return 1;
 
   return self->accept_connections ? 0 : 1;
 }
@@ -383,6 +502,24 @@ utp_napi_connection_destroy (utp_napi_connection_t *self) {
   napi_delete_reference(self->env, self->realloc);
 }
 
+/**
+ * Whether a CONNECTION callback may call into JavaScript.
+ *
+ * A connection struct carries no pointer back to its context, but every libutp
+ * callback is handed the context it belongs to, so the same plain-int check is
+ * available here. Both halves are required: a connection whose socket carries
+ * no userdata, and a context whose environment has gone.
+ *
+ * @param a - The callback arguments libutp passed in.
+ * @param self - The connection read from the socket's userdata.
+ * @returns Non-zero while it is safe to touch napi.
+ */
+static inline int
+utp_napi_connection_can_call_js (utp_callback_arguments *a, utp_napi_connection_t *self) {
+  if (self == NULL) return 0;
+  return utp_napi_can_call_js((utp_napi_t *) utp_context_get_userdata(a->context));
+}
+
 static uint64
 on_utp_state_change (utp_callback_arguments *a) {
   utp_napi_connection_t *self = (utp_napi_connection_t *) utp_get_userdata(a->socket);
@@ -408,7 +545,7 @@ on_utp_state_change (utp_callback_arguments *a) {
   // socket, and the destructor called in here -- where self->env was read off a
   // pointer that had never been set. The whole proxy died with it, since a
   // fault on any thread ends the process.
-  if (self == NULL) return 0;
+  if (!utp_napi_connection_can_call_js(a, self)) return 0;
 
   switch (a->state) {
     case UTP_STATE_CONNECT: {
@@ -460,6 +597,7 @@ on_utp_state_change (utp_callback_arguments *a) {
 static uint64
 on_utp_accept (utp_callback_arguments *a) {
   utp_napi_t *self = (utp_napi_t *) utp_context_get_userdata(a->context);
+  if (!utp_napi_can_call_js(self)) return 0;
 
   // No buffer to put this connection in means it cannot be accepted. That is
   // not a hypothetical: the buffer for the NEXT connection comes back from
@@ -516,10 +654,16 @@ on_utp_accept (utp_callback_arguments *a) {
     //     that early return writes nothing to `*result` (`src/node_api.cc`).
     //
     // So teardown is simply one of the ways this call fails without answering.
-    // Worth stating because the obvious remedy for the teardown pair — an
-    // `napi_add_env_cleanup_hook` that disarms the read — would not have helped
-    // either: `RunCleanup` drains the cleanup queue only AFTER `CleanupHandles`
-    // (`src/env.cc`), which is the frame those dumps died in.
+    //
+    // This paragraph used to end by dismissing `napi_add_env_cleanup_hook` —
+    // "`RunCleanup` drains the cleanup queue only AFTER `CleanupHandles`". Read
+    // again in node `src/env.cc`, that is half the ordering: `RunCleanup` calls
+    // `CleanupHandles()`, THEN drains the cleanup queue, and then calls
+    // `CleanupHandles()` again in the same loop. A hook is therefore early
+    // enough to take handles off the loop, and one is registered now
+    // (`on_env_teardown`). It does not make the guard below unnecessary — a
+    // callback can still arrive between the hook running and the handle
+    // closing — which is why both exist.
     //
     // The comment this replaces read "will never throw due to the event being
     // NTed in js". Whether it throws is beside the point — the value is unset
@@ -553,6 +697,7 @@ on_utp_accept (utp_callback_arguments *a) {
 static uint64
 on_utp_error (utp_callback_arguments *a) {
   utp_napi_connection_t *self = (utp_napi_connection_t *) utp_get_userdata(a->socket);
+  if (!utp_napi_connection_can_call_js(a, self)) return 0;
 
   // Same exposure as on_utp_state_change: an error can be reported for a socket
   // that never had a connection attached, and there is no one to tell.
@@ -570,6 +715,7 @@ on_utp_error (utp_callback_arguments *a) {
 static uint64
 on_utp_read (utp_callback_arguments *a) {
   utp_napi_connection_t *self = (utp_napi_connection_t *) utp_get_userdata(a->socket);
+  if (!utp_napi_connection_can_call_js(a, self)) return 0;
 
   if (self == NULL) return 0;
 
@@ -651,6 +797,8 @@ on_utp_read (utp_callback_arguments *a) {
 static uint64
 on_utp_sendto (utp_callback_arguments *a) {
   utp_napi_t *self = (utp_napi_t *) utp_context_get_userdata(a->context);
+  // Sending needs the read buffer and the send path, both JavaScript memory.
+  if (!utp_napi_can_call_js(self)) return 0;
   uv_buf_t buf = uv_buf_init((char *) a->buf, a->len);
 
   if (uv_udp_try_send(&(self->handle), &buf, 1, a->address) >= 0) return 0;
@@ -676,7 +824,18 @@ NAPI_METHOD(utp_napi_init) {
   self->pending_close = 2;
   self->family = AF_UNSPEC;
   self->env = env;
+  self->env_alive = 1;
+  self->self_ref = NULL;
   napi_create_reference(env, argv[1], 1, &(self->ctx));
+
+  // Hold the buffer this struct lives in, for as long as libuv holds the
+  // handles inside it. Without this the collector may free the memory the loop
+  // is still pointing at; with it, the memory outlives the registration.
+  napi_create_reference(env, argv[0], 1, &(self->self_ref));
+
+  // And be told before the environment goes, so the handles come off the loop
+  // while there is still a loop to take them off. See on_env_teardown.
+  napi_add_env_cleanup_hook(env, on_env_teardown, self);
 
   NAPI_ARGV_BUFFER_CAST(utp_napi_connection_t *, next, 2)
   self->next_connection = next;
@@ -760,6 +919,12 @@ NAPI_METHOD(utp_napi_destroy) {
     NAPI_BUFFER_CAST(utp_napi_send_request_t *, send_req, el)
     napi_delete_reference(env, send_req->ctx);
   }
+
+  // The hook holds a pointer to this struct. Once JavaScript has destroyed the
+  // context the struct is about to go, so the hook must not survive it — a
+  // cleanup hook left registered fires later against freed memory, which is the
+  // very shape this change exists to remove.
+  napi_remove_env_cleanup_hook(env, on_env_teardown, self);
 
   utp_destroy(self->utp);
   self->utp = NULL;
