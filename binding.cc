@@ -429,6 +429,27 @@ on_uv_close (uv_handle_t *handle) {
   self->pending_close--;
   if (self->pending_close > 0) return;
 
+  // The environment cleanup hook goes FIRST, and this is the defect that the
+  // core dump of 2026-08-27 21:10 was made of.
+  //
+  // The hook is registered per context at init and holds a raw pointer to it.
+  // Releasing the reference below lets the collector free that memory, and the
+  // hook stayed registered against it. At teardown the hook then ran on freed
+  // memory: it wrote its flag there, read a stale `closing`, and called
+  // `uv_close` on handles that no longer existed -- pushing a dead handle into
+  // the loop's closing machinery. The fault surfaced later and elsewhere, when
+  // `uv__finish_close` unlinked a HEALTHY handle and its neighbour in
+  // `loop->handle_queue` was that dead one:
+  //
+  //   #0  QUEUE_REMOVE, str x1,[x0,#8]   -- x0 unmapped
+  //   #1  uv__finish_close
+  //   ..  node::worker::Worker::Run()
+  //
+  // Read in the dump: the handle being closed was type 15 (UV_UDP) with
+  // `data` pointing at itself, which is this struct; its queue neighbour lay
+  // at an address in the same region that gdb could not read at all.
+  napi_remove_env_cleanup_hook(self->env, on_env_teardown, self);
+
   // libuv has finished with both handles, so the memory they live in is free to
   // go. Released before the callback, because that callback is where
   // JavaScript drops its own reference to the same buffer.
