@@ -21,15 +21,17 @@ function UTP (opts) {
   this._sent = []
   this._offset = 0
   this._buffer = Buffer.allocUnsafe(2 * 65536)
-  this._handle = Buffer.alloc(binding.sizeof_utp_napi_t)
-  this._nextConnection = Buffer.alloc(binding.sizeof_utp_napi_connection_t)
+  // Tokens, not the structs themselves. The module owns that memory now and
+  // frees it when libuv has finished with the handles inside it; a buffer here
+  // would put it back under the collector, which is the fault this replaces.
+  this._handle = binding.utp_napi_alloc()
+  this._nextConnection = binding.utp_napi_connection_alloc()
   this._address = null
   this._inited = false
   this._refed = true
   this._closing = false
   this._closed = false
   this._allowHalfOpen = !opts || opts.allowHalfOpen !== false
-  this._acceptConnections = new Uint32Array(this._handle.buffer, this._handle.byteOffset + binding.offsetof_utp_napi_t_accept_connections, 1)
   this.maxConnections = 0
 }
 
@@ -64,7 +66,7 @@ UTP.prototype._init = function () {
 }
 
 UTP.prototype.firewall = function (yes) {
-  this._acceptConnections[0] = yes ? 0 : 1
+  binding.utp_napi_set_accept_connections(this._handle, yes ? 0 : 1)
 }
 
 UTP.prototype.ref = function () {
@@ -124,7 +126,7 @@ UTP.prototype.send = function (buf, offset, len, port, host, cb) {
 
   var send = this._sent.pop()
   if (!send) {
-    send = new SendRequest()
+    send = new SendRequest(this)
     binding.utp_napi_send_request_init(send._handle, send)
   }
 
@@ -275,7 +277,7 @@ UTP.prototype._onsend = function (send, status) {
 UTP.prototype._onconnection = function (port, addr) {
   const conn = new Connection(this, port, addr, this._nextConnection, this._allowHalfOpen)
   process.nextTick(emitConnection, this, conn)
-  this._nextConnection = Buffer.alloc(binding.sizeof_utp_napi_connection_t)
+  this._nextConnection = binding.utp_napi_connection_alloc()
   return this._nextConnection
 }
 
@@ -285,8 +287,8 @@ UTP.prototype._onclose = function () {
   this.emit('close')
 }
 
-function SendRequest () {
-  this._handle = Buffer.alloc(binding.sizeof_utp_napi_send_request_t)
+function SendRequest (utp) {
+  this._handle = binding.utp_napi_send_request_alloc(utp._handle)
   this._buffer = null
   this._callback = null
   this._index = null

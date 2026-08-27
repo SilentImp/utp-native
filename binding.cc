@@ -147,6 +147,14 @@ typedef struct {
   // napi_delete_reference calls in the teardown are not idempotent, so a
   // second run deletes references that are already gone.
   uint32_t destroyed;
+  /**
+   * A strong reference to the TOKEN buffer JavaScript holds for this struct.
+   *
+   * libutp keeps this struct as a socket's userdata and calls into it from its
+   * own timeout sweep, so its lifetime is not JavaScript's to decide either.
+   * Allocated and freed by the module; the token is pointed at nothing first.
+   */
+  napi_ref token_ref;
 } utp_napi_connection_t;
 
 typedef struct {
@@ -176,24 +184,126 @@ typedef struct {
    */
   int env_alive;
   /**
-   * A strong reference to the JavaScript buffer this struct LIVES IN.
+   * A strong reference to the TOKEN buffer JavaScript holds for this struct.
    *
-   * `uv_udp_t handle` and `uv_timer_t timer` above are fields of this struct,
-   * and `uv_udp_init`/`uv_timer_init` register them on the loop — so libuv
-   * holds pointers into memory owned by the garbage collector for as long as
-   * they stay registered. Held from here until both handles have closed, so
-   * the collector cannot take it out from under libuv.
+   * The struct itself is the module's, allocated with `calloc` and freed when
+   * libuv has finished with both handles. The reference exists only so that
+   * the token can be pointed at nothing before the memory goes, which turns
+   * every later call from JavaScript into a no-op instead of a fault.
    */
-  napi_ref self_ref;
+  napi_ref token_ref;
+  /** Send requests belonging to this context, freed with it. */
+  struct utp_napi_send_request_s *sends;
   // The address family this socket was actually bound with. Everything sent
   // from it has to be expressed in that family.
   int family;
 } utp_napi_t;
 
-typedef struct {
+typedef struct utp_napi_send_request_s {
   uv_udp_send_t req;
   napi_ref ctx;
+  /** A strong reference to the token buffer, so it can be cleared on free. */
+  napi_ref token_ref;
+  /** Next request belonging to the same context; the context frees the chain. */
+  struct utp_napi_send_request_s *next;
 } utp_napi_send_request_t;
+
+/**
+ * Ownership of the native structs, and why it is not JavaScript's.
+ *
+ * These structs contain libuv handles and requests: `uv_udp_t` and `uv_timer_t`
+ * in the context, `uv_udp_send_t` in a send request. libuv's rule is that once
+ * such a thing is registered on a loop, its memory must stay valid until the
+ * close or completion callback has run. Until 2.5.3-ttv.7 the structs were
+ * allocated by JavaScript as `Buffer.alloc(sizeof(...))`, which put them under
+ * the garbage collector — a second owner, with a different rule, and nothing
+ * reconciling the two. Nine crashes came out of that gap, each a variation on
+ * libuv holding a pointer into memory that had gone.
+ *
+ * So the module allocates them and the module frees them, at the point where
+ * libuv has provably finished. JavaScript holds a TOKEN: a small buffer whose
+ * only content is the pointer. Freeing writes NULL into the token first, so any
+ * later call from JavaScript reads NULL and returns without doing anything,
+ * rather than dereferencing a corpse.
+ *
+ * @param env
+ * @param token - The buffer JavaScript holds.
+ * @returns The struct, or NULL when it has been released.
+ */
+static void *
+utp_napi_token_read (napi_env env, napi_value token) {
+  void *data = NULL;
+  size_t len = 0;
+  if (napi_get_buffer_info(env, token, &data, &len) != napi_ok) return NULL;
+  if (data == NULL || len < sizeof(void *)) return NULL;
+  return *((void **) data);
+}
+
+/**
+ * Point a token at a struct, or at nothing.
+ *
+ * @param env
+ * @param token_ref - Reference to the token buffer; NULL is tolerated.
+ * @param value - The struct, or NULL to release the token.
+ * @returns {void}
+ */
+static void
+utp_napi_token_write (napi_env env, napi_ref token_ref, void *value) {
+  if (token_ref == NULL) return;
+  // Its own handle scope. This is called from libuv's close callback and from
+  // libutp's socket destructor, neither of which runs inside one, and reading a
+  // reference creates a handle -- without a scope V8 ends the process with
+  // "Cannot create a handle without a HandleScope".
+  napi_handle_scope scope;
+  if (napi_open_handle_scope(env, &scope) != napi_ok) return;
+  napi_value token;
+  if (napi_get_reference_value(env, token_ref, &token) == napi_ok && token != NULL) {
+    void *data = NULL;
+    size_t len = 0;
+    if (napi_get_buffer_info(env, token, &data, &len) == napi_ok &&
+        data != NULL && len >= sizeof(void *)) {
+      *((void **) data) = value;
+    }
+  }
+  napi_close_handle_scope(env, scope);
+}
+
+/**
+ * Hand JavaScript a token for a freshly allocated struct.
+ *
+ * @param env
+ * @param bytes - Size of the struct to allocate.
+ * @param out_struct - Receives the struct.
+ * @param out_token - Receives the token buffer.
+ * @returns Non-zero on failure, with an error already thrown.
+ */
+static int
+utp_napi_token_create (napi_env env, size_t bytes, void **out_struct, napi_value *out_token) {
+  void *self = calloc(1, bytes);
+  if (self == NULL) {
+    napi_throw_error(env, NULL, "out of memory");
+    return 1;
+  }
+  void *data = NULL;
+  if (napi_create_buffer(env, sizeof(void *), &data, out_token) != napi_ok || data == NULL) {
+    free(self);
+    napi_throw_error(env, NULL, "could not allocate a handle token");
+    return 1;
+  }
+  *((void **) data) = self;
+  *out_struct = self;
+  return 0;
+}
+
+/**
+ * Read the struct a method was called on, or return without doing anything.
+ *
+ * A method reached after the struct was freed is not an error to report: it is
+ * the ordinary consequence of teardown racing a caller, and the right answer is
+ * to do nothing. Every entry point uses this, so none of them can dereference a
+ * released struct.
+ */
+#define UTP_NAPI_ARGV_SELF(type, name, i)   type name = (type) utp_napi_token_read(env, argv[i]);   if (name == NULL) return NULL;
 
 static void
 on_sendto_free (uv_udp_send_t *req, int status) {
@@ -450,19 +560,43 @@ on_uv_close (uv_handle_t *handle) {
   // at an address in the same region that gdb could not read at all.
   napi_remove_env_cleanup_hook(self->env, on_env_teardown, self);
 
-  // libuv has finished with both handles, so the memory they live in is free to
-  // go. Released before the callback, because that callback is where
-  // JavaScript drops its own reference to the same buffer.
-  if (self->env_alive && self->self_ref != NULL) {
-    napi_delete_reference(self->env, self->self_ref);
-    self->self_ref = NULL;
-  }
-
+  // libuv has finished with both handles. This is the only place the context
+  // is freed, and it is reached only from libuv's own close callback, which
+  // `uv__finish_close` calls AFTER unlinking the handle from the loop. So there
+  // is no moment at which the loop holds a pointer into freed memory.
+  //
+  // The environment being gone is the one case where nothing is freed: the
+  // process is ending, JavaScript will not run again, and a deliberate leak at
+  // that point is better in every way than touching napi during teardown.
   if (!utp_napi_can_call_js(self)) return;
 
+  // JavaScript first, while the struct is still whole: `_onclose` calls
+  // `utp_napi_destroy`, which needs it.
   UTP_NAPI_CALLBACK(self->on_close, {
     NAPI_MAKE_CALLBACK(env, NULL, ctx, callback, 0, NULL, NULL);
   })
+
+  // Send requests carry `uv_udp_send_t`, which is a libuv REQUEST and lives
+  // under the same rule as a handle. The socket is closed, so libuv has
+  // completed or cancelled every one of them.
+  utp_napi_send_request_t *send_req = self->sends;
+  while (send_req != NULL) {
+    utp_napi_send_request_t *next = send_req->next;
+    utp_napi_token_write(self->env, send_req->token_ref, NULL);
+    if (send_req->token_ref != NULL) napi_delete_reference(self->env, send_req->token_ref);
+    free(send_req);
+    send_req = next;
+  }
+  self->sends = NULL;
+
+  // Point the token at nothing BEFORE freeing, so a call that arrives after
+  // this reads NULL and does nothing.
+  utp_napi_token_write(self->env, self->token_ref, NULL);
+  if (self->token_ref != NULL) {
+    napi_delete_reference(self->env, self->token_ref);
+    self->token_ref = NULL;
+  }
+  free(self);
 }
 
 static void
@@ -521,6 +655,16 @@ utp_napi_connection_destroy (utp_napi_connection_t *self) {
   napi_delete_reference(self->env, self->on_error);
   napi_delete_reference(self->env, self->on_close);
   napi_delete_reference(self->env, self->realloc);
+
+  // The socket no longer points here and every reference is gone, so nothing
+  // native can reach this struct again. Point the token at nothing first, so a
+  // late call from JavaScript reads NULL and returns, and only then free.
+  utp_napi_token_write(self->env, self->token_ref, NULL);
+  if (self->token_ref != NULL) {
+    napi_delete_reference(self->env, self->token_ref);
+    self->token_ref = NULL;
+  }
+  free(self);
 }
 
 /**
@@ -697,11 +841,10 @@ on_utp_accept (utp_callback_arguments *a) {
       napi_get_and_clear_last_exception(env, &fatal_exception);
       napi_fatal_exception(env, fatal_exception);
     }
-    utp_napi_connection_t *connection = NULL;
-    size_t connection_size = 0;
-    if (accept_status == napi_ok && next != NULL &&
-        napi_get_buffer_info(env, next, (void **) &connection, &connection_size) == napi_ok &&
-        connection_size >= sizeof(utp_napi_connection_t)) {
+    utp_napi_connection_t *connection = accept_status == napi_ok && next != NULL
+      ? (utp_napi_connection_t *) utp_napi_token_read(env, next)
+      : NULL;
+    if (connection != NULL) {
       self->next_connection = connection;
     } else {
       // Nothing usable came back. The buffer that was here has just been given
@@ -837,28 +980,119 @@ on_utp_sendto (utp_callback_arguments *a) {
   return 0;
 }
 
+/**
+ * Allocate a context and hand JavaScript a token for it.
+ *
+ * Separate from `utp_napi_init` because the token has to exist before init can
+ * be given it, and because allocation is the module's job now.
+ *
+ * @returns The token buffer.
+ */
+NAPI_METHOD(utp_napi_alloc) {
+  void *self = NULL;
+  napi_value token;
+  if (utp_napi_token_create(env, sizeof(utp_napi_t), &self, &token)) return NULL;
+  return token;
+}
+
+/**
+ * Allocate a connection and hand JavaScript a token for it.
+ *
+ * @returns The token buffer.
+ */
+NAPI_METHOD(utp_napi_connection_alloc) {
+  void *self = NULL;
+  napi_value token;
+  if (utp_napi_token_create(env, sizeof(utp_napi_connection_t), &self, &token)) return NULL;
+  napi_create_reference(env, token, 1, &(((utp_napi_connection_t *) self)->token_ref));
+  return token;
+}
+
+/**
+ * Allocate a send request and hand JavaScript a token for it.
+ *
+ * The request is linked onto its context, which frees the whole chain when
+ * libuv has finished with the socket. A `uv_udp_send_t` is a libuv REQUEST and
+ * carries the same rule as a handle: the memory must outlive the operation.
+ *
+ * @returns The token buffer.
+ */
+NAPI_METHOD(utp_napi_send_request_alloc) {
+  NAPI_ARGV(1)
+  UTP_NAPI_ARGV_SELF(utp_napi_t *, self, 0)
+
+  void *request = NULL;
+  napi_value token;
+  if (utp_napi_token_create(env, sizeof(utp_napi_send_request_t), &request, &token)) return NULL;
+
+  utp_napi_send_request_t *send_req = (utp_napi_send_request_t *) request;
+  napi_create_reference(env, token, 1, &(send_req->token_ref));
+  send_req->next = self->sends;
+  self->sends = send_req;
+  return token;
+}
+
+/**
+ * Whether the context accepts incoming connections.
+ *
+ * JavaScript used to write this field through a `Uint32Array` laid over the
+ * struct's own bytes. It cannot any more — the struct is not in a buffer it can
+ * see — and a setter is the honest way to expose one field rather than the
+ * whole of memory.
+ *
+ * @returns {void}
+ */
+NAPI_METHOD(utp_napi_set_accept_connections) {
+  NAPI_ARGV(2)
+  UTP_NAPI_ARGV_SELF(utp_napi_t *, self, 0)
+  NAPI_ARGV_UINT32(accept, 1)
+
+  self->accept_connections = accept;
+  return NULL;
+}
+
+/**
+ * The smallest packet this connection will accept before asking for more room.
+ *
+ * JavaScript used to write this through a `Uint32Array` laid over the struct's
+ * first two words. It cannot any more, and one field exposed deliberately is
+ * better than the whole of memory exposed by accident.
+ *
+ * @returns {void}
+ */
+NAPI_METHOD(utp_napi_connection_set_min_recv_packet_size) {
+  NAPI_ARGV(2)
+  UTP_NAPI_ARGV_SELF(utp_napi_connection_t *, self, 0)
+  NAPI_ARGV_UINT32(size, 1)
+
+  self->min_recv_packet_size = size;
+  return NULL;
+}
+
 NAPI_METHOD(utp_napi_init) {
   NAPI_ARGV(9)
-  NAPI_ARGV_BUFFER_CAST(utp_napi_t *, self, 0)
+  UTP_NAPI_ARGV_SELF(utp_napi_t *, self, 0)
 
   self->closing = 0;
   self->pending_close = 2;
   self->family = AF_UNSPEC;
   self->env = env;
   self->env_alive = 1;
-  self->self_ref = NULL;
+  self->token_ref = NULL;
   napi_create_reference(env, argv[1], 1, &(self->ctx));
 
-  // Hold the buffer this struct lives in, for as long as libuv holds the
-  // handles inside it. Without this the collector may free the memory the loop
-  // is still pointing at; with it, the memory outlives the registration.
-  napi_create_reference(env, argv[0], 1, &(self->self_ref));
+  // Hold the TOKEN, so that the pointer inside it can be cleared before this
+  // struct is freed. The struct's own lifetime no longer depends on the
+  // collector at all: it is allocated by `utp_napi_alloc` and freed once libuv
+  // has finished with both handles.
+  napi_create_reference(env, argv[0], 1, &(self->token_ref));
+  self->sends = NULL;
 
   // And be told before the environment goes, so the handles come off the loop
   // while there is still a loop to take them off. See on_env_teardown.
   napi_add_env_cleanup_hook(env, on_env_teardown, self);
 
-  NAPI_ARGV_BUFFER_CAST(utp_napi_connection_t *, next, 2)
+  UTP_NAPI_ARGV_SELF(utp_napi_connection_t *, next, 2)
   self->next_connection = next;
 
   uv_timer_t *timer = &(self->timer);
@@ -903,7 +1137,7 @@ NAPI_METHOD(utp_napi_init) {
 
 NAPI_METHOD(utp_napi_close) {
   NAPI_ARGV(1)
-  NAPI_ARGV_BUFFER_CAST(utp_napi_t *, self, 0)
+  UTP_NAPI_ARGV_SELF(utp_napi_t *, self, 0)
 
   self->closing = 1;
 
@@ -923,7 +1157,7 @@ NAPI_METHOD(utp_napi_close) {
 
 NAPI_METHOD(utp_napi_destroy) {
   NAPI_ARGV(2)
-  NAPI_ARGV_BUFFER_CAST(utp_napi_t *, self, 0)
+  UTP_NAPI_ARGV_SELF(utp_napi_t *, self, 0)
   napi_value send_reqs = argv[1];
 
   self->buf.base = NULL;
@@ -936,9 +1170,17 @@ NAPI_METHOD(utp_napi_destroy) {
   napi_delete_reference(env, self->on_close);
   napi_delete_reference(env, self->realloc);
 
+  // The array holds tokens now, not the structs themselves. A token that has
+  // already been released reads NULL and is skipped: a send request can be
+  // freed before this runs only if the context was, and then nothing would be
+  // calling here at all.
   NAPI_FOR_EACH(send_reqs, el) {
-    NAPI_BUFFER_CAST(utp_napi_send_request_t *, send_req, el)
-    napi_delete_reference(env, send_req->ctx);
+    utp_napi_send_request_t *send_req = (utp_napi_send_request_t *) utp_napi_token_read(env, el);
+    if (send_req == NULL) continue;
+    if (send_req->ctx != NULL) {
+      napi_delete_reference(env, send_req->ctx);
+      send_req->ctx = NULL;
+    }
   }
 
   // The hook holds a pointer to this struct. Once JavaScript has destroyed the
@@ -955,7 +1197,7 @@ NAPI_METHOD(utp_napi_destroy) {
 
 NAPI_METHOD(utp_napi_bind) {
   NAPI_ARGV(3)
-  NAPI_ARGV_BUFFER_CAST(utp_napi_t *, self, 0)
+  UTP_NAPI_ARGV_SELF(utp_napi_t *, self, 0)
   NAPI_ARGV_UINT32(port, 1)
   NAPI_ARGV_UTF8(ip, UTP_NAPI_IP_MAX, 2)
 
@@ -989,7 +1231,7 @@ NAPI_METHOD(utp_napi_bind) {
 
 NAPI_METHOD(utp_napi_local_port) {
   NAPI_ARGV(1)
-  NAPI_ARGV_BUFFER_CAST(utp_napi_t *, self, 0)
+  UTP_NAPI_ARGV_SELF(utp_napi_t *, self, 0)
 
   int err;
   struct sockaddr_storage name;
@@ -1007,7 +1249,7 @@ NAPI_METHOD(utp_napi_local_port) {
 
 NAPI_METHOD(utp_napi_send_request_init) {
   NAPI_ARGV(2)
-  NAPI_ARGV_BUFFER_CAST(utp_napi_send_request_t *, send_req, 0)
+  UTP_NAPI_ARGV_SELF(utp_napi_send_request_t *, send_req, 0)
 
   uv_udp_send_t *req = &(send_req->req);
   req->data = send_req;
@@ -1019,8 +1261,8 @@ NAPI_METHOD(utp_napi_send_request_init) {
 
 NAPI_METHOD(utp_napi_send) {
   NAPI_ARGV(7)
-  NAPI_ARGV_BUFFER_CAST(utp_napi_t *, self, 0)
-  NAPI_ARGV_BUFFER_CAST(utp_napi_send_request_t *, send_req, 1)
+  UTP_NAPI_ARGV_SELF(utp_napi_t *, self, 0)
+  UTP_NAPI_ARGV_SELF(utp_napi_send_request_t *, send_req, 1)
   NAPI_ARGV_BUFFER(buf, 2)
   NAPI_ARGV_UINT32(offset, 3)
   NAPI_ARGV_UINT32(len, 4)
@@ -1049,7 +1291,7 @@ NAPI_METHOD(utp_napi_send) {
 
 NAPI_METHOD(utp_napi_ref) {
   NAPI_ARGV(1)
-  NAPI_ARGV_BUFFER_CAST(utp_napi_t *, self, 0)
+  UTP_NAPI_ARGV_SELF(utp_napi_t *, self, 0)
 
   uv_ref((uv_handle_t *) &(self->handle));
 
@@ -1058,7 +1300,7 @@ NAPI_METHOD(utp_napi_ref) {
 
 NAPI_METHOD(utp_napi_unref) {
   NAPI_ARGV(1)
-  NAPI_ARGV_BUFFER_CAST(utp_napi_t *, self, 0)
+  UTP_NAPI_ARGV_SELF(utp_napi_t *, self, 0)
 
   uv_unref((uv_handle_t *) &(self->handle));
 
@@ -1067,7 +1309,7 @@ NAPI_METHOD(utp_napi_unref) {
 
 NAPI_METHOD(utp_napi_recv_buffer) {
   NAPI_ARGV(2)
-  NAPI_ARGV_BUFFER_CAST(utp_napi_t *, self, 0)
+  UTP_NAPI_ARGV_SELF(utp_napi_t *, self, 0)
   NAPI_ARGV_INT32(size, 1)
 
   int err;
@@ -1078,7 +1320,7 @@ NAPI_METHOD(utp_napi_recv_buffer) {
 
 NAPI_METHOD(utp_napi_send_buffer) {
   NAPI_ARGV(2)
-  NAPI_ARGV_BUFFER_CAST(utp_napi_t *, self, 0)
+  UTP_NAPI_ARGV_SELF(utp_napi_t *, self, 0)
   NAPI_ARGV_INT32(size, 1)
 
   int err;
@@ -1089,7 +1331,7 @@ NAPI_METHOD(utp_napi_send_buffer) {
 
 NAPI_METHOD(utp_napi_set_ttl) {
   NAPI_ARGV(2)
-  NAPI_ARGV_BUFFER_CAST(utp_napi_t *, self, 0)
+  UTP_NAPI_ARGV_SELF(utp_napi_t *, self, 0)
   NAPI_ARGV_UINT32(ttl, 1)
 
   int err;
@@ -1100,7 +1342,7 @@ NAPI_METHOD(utp_napi_set_ttl) {
 
 NAPI_METHOD(utp_napi_connection_init) {
   NAPI_ARGV(10)
-  NAPI_ARGV_BUFFER_CAST(utp_napi_connection_t *, self, 0)
+  UTP_NAPI_ARGV_SELF(utp_napi_connection_t *, self, 0)
 
   self->env = env;
 
@@ -1125,14 +1367,14 @@ NAPI_METHOD(utp_napi_connection_on_close) {
   // To trigger a manual teardown if connect was never called
   // on a client connection
   NAPI_ARGV(1)
-  NAPI_ARGV_BUFFER_CAST(utp_napi_connection_t *, self, 0)
+  UTP_NAPI_ARGV_SELF(utp_napi_connection_t *, self, 0)
   utp_napi_connection_destroy(self);
   return NULL;
 }
 
 NAPI_METHOD(utp_napi_connection_write) {
   NAPI_ARGV(2)
-  NAPI_ARGV_BUFFER_CAST(utp_napi_connection_t *, self, 0)
+  UTP_NAPI_ARGV_SELF(utp_napi_connection_t *, self, 0)
   NAPI_ARGV_BUFFER(buf, 1)
 
   // A write that arrives after teardown is a write to a closed socket. The
@@ -1152,7 +1394,7 @@ NAPI_METHOD(utp_napi_connection_write) {
 
 NAPI_METHOD(utp_napi_connection_writev) {
   NAPI_ARGV(2)
-  NAPI_ARGV_BUFFER_CAST(utp_napi_connection_t *, self, 0)
+  UTP_NAPI_ARGV_SELF(utp_napi_connection_t *, self, 0)
 
   // Same as utp_napi_connection_write above.
   if (utp_napi_connection_gone(self)) { NAPI_RETURN_UINT32(1) }
@@ -1176,7 +1418,7 @@ NAPI_METHOD(utp_napi_connection_writev) {
 
 NAPI_METHOD(utp_napi_connection_shutdown) {
   NAPI_ARGV(1)
-  NAPI_ARGV_BUFFER_CAST(utp_napi_connection_t *, self, 0)
+  UTP_NAPI_ARGV_SELF(utp_napi_connection_t *, self, 0)
 
   // Already shut down as far as anyone can tell.
   if (utp_napi_connection_gone(self)) return NULL;
@@ -1188,7 +1430,7 @@ NAPI_METHOD(utp_napi_connection_shutdown) {
 
 NAPI_METHOD(utp_napi_connection_close) {
   NAPI_ARGV(1)
-  NAPI_ARGV_BUFFER_CAST(utp_napi_connection_t *, self, 0)
+  UTP_NAPI_ARGV_SELF(utp_napi_connection_t *, self, 0)
 
   // Closing twice is what the module's own "double close" test does, and the
   // second call must not reach libutp with a pointer that is gone.
@@ -1201,8 +1443,8 @@ NAPI_METHOD(utp_napi_connection_close) {
 
 NAPI_METHOD(utp_napi_connect) {
   NAPI_ARGV(4)
-  NAPI_ARGV_BUFFER_CAST(utp_napi_t *, self, 0)
-  NAPI_ARGV_BUFFER_CAST(utp_napi_connection_t *, conn, 1)
+  UTP_NAPI_ARGV_SELF(utp_napi_t *, self, 0)
+  UTP_NAPI_ARGV_SELF(utp_napi_connection_t *, conn, 1)
   NAPI_ARGV_UINT32(port, 2)
   NAPI_ARGV_UTF8(ip, UTP_NAPI_IP_MAX, 3)
 
@@ -1230,10 +1472,11 @@ NAPI_METHOD(utp_napi_connect) {
 }
 
 NAPI_INIT() {
-  NAPI_EXPORT_SIZEOF(utp_napi_t)
-  NAPI_EXPORT_SIZEOF(utp_napi_send_request_t)
-  NAPI_EXPORT_SIZEOF(utp_napi_connection_t)
-  NAPI_EXPORT_OFFSETOF(utp_napi_t, accept_connections)
+  NAPI_EXPORT_FUNCTION(utp_napi_alloc)
+  NAPI_EXPORT_FUNCTION(utp_napi_connection_alloc)
+  NAPI_EXPORT_FUNCTION(utp_napi_send_request_alloc)
+  NAPI_EXPORT_FUNCTION(utp_napi_set_accept_connections)
+  NAPI_EXPORT_FUNCTION(utp_napi_connection_set_min_recv_packet_size)
   NAPI_EXPORT_FUNCTION(utp_napi_init)
   NAPI_EXPORT_FUNCTION(utp_napi_bind)
   NAPI_EXPORT_FUNCTION(utp_napi_local_port)
